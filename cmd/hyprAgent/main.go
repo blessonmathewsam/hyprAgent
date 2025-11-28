@@ -48,7 +48,12 @@ GUIDELINES:
 2. EXPLORATION: Use 'list_dir' and 'read_file' to locate relevant config files within allowed paths.
 3. ANALYSIS: Read the config files to understand the current state.
 4. PLANNING: Formulate a plan.
-5. PATCHING PROTOCOL (IMPORTANT):
+5. DOCUMENTATION:
+   - If you are unsure about a configuration option, variable name, or syntax, use 'fetch_url' to check the official Hyprland Wiki or other online documentation.
+   - Suggested Wiki: https://wiki.hyprland.org/Configuring/
+   - Verify your patch suggestions against the documentation before applying.
+   - If a file read fails because of size or binary content, ask the user for specific sections or use 'grep' (if available) or just skip it.
+6. PATCHING PROTOCOL (IMPORTANT):
    - FIRST, use 'make_patch' to generate the diff.
    - STOP and show this diff to the user in your response.
    - ASK the user for confirmation (e.g., "Shall I apply this change?").
@@ -233,6 +238,8 @@ func main() {
 		Config:   cfg,
 	})
 	registry.Register(&assistant.RollbackTool{Snapshot: snapshotService})
+	registry.Register(&assistant.FetchURLTool{})
+	registry.Register(&assistant.GrepTool{Config: cfg, Backend: activeBackend})
 
 	// Initialize Assistant with dynamic max turns
 	agent := assistant.NewAgent(llm, registry, systemPrompt)

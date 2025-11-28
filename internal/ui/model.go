@@ -128,7 +128,8 @@ type agentMsg struct {
 }
 
 type statusMsg struct {
-	msg string
+	msg  string
+	diff string
 }
 
 func listenForUpdates(sub <-chan assistant.StatusUpdate) tea.Cmd {
@@ -137,7 +138,7 @@ func listenForUpdates(sub <-chan assistant.StatusUpdate) tea.Cmd {
 		if !ok {
 			return nil
 		}
-		return statusMsg{msg: update.Message}
+		return statusMsg{msg: update.Message, diff: update.Diff}
 	}
 }
 
@@ -233,6 +234,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.statusHistory) > 3 {
 			m.statusHistory = m.statusHistory[len(m.statusHistory)-3:]
 		}
+
+		// If there's a diff, render it immediately to the viewport
+		if msg.diff != "" {
+			diffHeader := styleAgentHeader.Render(" Proposed Changes:")
+			// Use a simple style for diff content, maybe syntax highlight later
+			diffBody := lipgloss.NewStyle().Foreground(colorSubtext).Render(msg.diff)
+			// Wrap in code block style or similar
+			diffBlock := fmt.Sprintf("\n%s\n```diff\n%s\n```\n", diffHeader, diffBody)
+
+			newContent := m.viewport.View() + diffBlock
+			m.viewport.SetContent(newContent)
+			m.viewport.GotoBottom()
+		}
+
 		if m.state == StateThinking {
 			cmds = append(cmds, listenForUpdates(m.agent.Updates()))
 		}

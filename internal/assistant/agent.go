@@ -11,6 +11,7 @@ import (
 // StatusUpdate represents a real-time update from the agent
 type StatusUpdate struct {
 	Message string
+	Diff    string // Optional diff content to display
 }
 
 // Agent manages the conversation flow between the user, the LLM, and the tools
@@ -29,7 +30,7 @@ func NewAgent(provider LLMProvider, registry *ToolRegistry, systemPrompt string)
 		registry: registry,
 		history:  make([]Message, 0),
 		system:   systemPrompt,
-		updates:  make(chan StatusUpdate, 10), // Buffered channel
+		updates:  make(chan StatusUpdate, 20), // Buffered channel
 	}
 	return agent
 }
@@ -45,6 +46,14 @@ func (a *Agent) sendUpdate(msg string) {
 	case a.updates <- StatusUpdate{Message: msg}:
 	default:
 		// Drop if channel full or no listener
+	}
+}
+
+// sendDiffUpdate sends a diff update
+func (a *Agent) sendDiffUpdate(diff string) {
+	select {
+	case a.updates <- StatusUpdate{Message: "Proposed changes:", Diff: diff}:
+	default:
 	}
 }
 
@@ -120,6 +129,10 @@ func (a *Agent) ProcessMessage(ctx context.Context, input string) (string, error
 					a.sendUpdate("Generating configuration patch...")
 				case "apply_patch":
 					a.sendUpdate("Requesting to apply patch...")
+				case "fetch_url":
+					a.sendUpdate("Fetching documentation...")
+				case "grep":
+					a.sendUpdate("Searching for pattern in files...")
 				}
 
 				tool, ok := a.registry.Get(tc.Function.Name)
@@ -144,6 +157,11 @@ func (a *Agent) ProcessMessage(ctx context.Context, input string) (string, error
 				} else {
 					logger.Debug("Tool Output (%s): %s", tc.Function.Name, output)
 					a.sendUpdate(fmt.Sprintf("Finished %s", tc.Function.Name))
+
+					// If this was make_patch, send the diff to UI
+					if tc.Function.Name == "make_patch" {
+						a.sendDiffUpdate(output)
+					}
 				}
 
 				results[i] = Message{

@@ -3,8 +3,12 @@ package assistant
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/reinhart/hyprAgent/internal/configuration"
 	"github.com/reinhart/hyprAgent/internal/safety"
@@ -90,7 +94,125 @@ func (t *ReadFileTool) Execute(args string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to read file: %w", err)
 	}
+
+	// 1. Check size limit (e.g. 100KB limit for context)
+	const maxFileSize = 100 * 1024
+	if len(content) > maxFileSize {
+		return "", fmt.Errorf("file too large (%d bytes). Max allowed is %d bytes. Please use 'grep' or read specific sections if possible, or ask the user to summarize", len(content), maxFileSize)
+	}
+
+	// 2. Check for binary content
+	if !utf8.Valid(content) {
+		// It might still be text in another encoding, but for safety we assume non-UTF8 is binary-like or risky
+		// A more robust check involves looking for null bytes
+		if strings.Contains(string(content), "\x00") {
+			return "", fmt.Errorf("file appears to be binary (contains null bytes). Cannot read binary files")
+		}
+	}
+
 	return string(content), nil
+}
+
+type GrepTool struct {
+	Config  *configuration.Config
+	Backend configuration.ConfigBackend
+}
+
+type GrepArgs struct {
+	Pattern string `json:"pattern"`
+	Path    string `json:"path"` // Optional, if empty, search all allowed files
+}
+
+func (t *GrepTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        "grep",
+		Description: "Search for a regex pattern in files. Useful for finding specific configs in large files.",
+		Parameters: json.RawMessage(`{
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "The regex pattern to search for (Go regex syntax)"},
+                "path": {"type": "string", "description": "Optional specific file to search in. If omitted, searches all allowed files."}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }`),
+	}
+}
+
+func (t *GrepTool) Execute(args string) (string, error) {
+	var a GrepArgs
+	if err := ParseArgs(args, &a); err != nil {
+		return "", err
+	}
+
+	// Compile regex first to fail fast
+	re, err := regexp.Compile(a.Pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid regex pattern: %w", err)
+	}
+
+	backendType := t.Backend.Type()
+	var filesToSearch []string
+
+	if a.Path != "" {
+		// Search specific file
+		allowed, err := t.Config.IsPathAllowed(backendType, a.Path)
+		if err != nil || !allowed {
+			return "", fmt.Errorf("access denied: %v", err)
+		}
+		filesToSearch = []string{a.Path}
+	} else {
+		// Search all sources
+		sources, err := t.Backend.ListSources()
+		if err != nil {
+			return "", fmt.Errorf("failed to list sources: %w", err)
+		}
+		filesToSearch = sources
+	}
+
+	var results []string
+	const maxResults = 50 // Limit results to avoid context spam
+
+	for _, file := range filesToSearch {
+		contentBytes, err := os.ReadFile(file)
+		if err != nil {
+			continue // Skip unreadable files
+		}
+
+		// Check binary
+		if strings.Contains(string(contentBytes), "\x00") {
+			continue
+		}
+
+		lines := strings.Split(string(contentBytes), "\n")
+		for i, line := range lines {
+			if re.MatchString(line) {
+				// Format: File:Line: Content
+				// Truncate extremely long lines
+				displayLine := line
+				if len(displayLine) > 200 {
+					displayLine = displayLine[:200] + "..."
+				}
+				results = append(results, fmt.Sprintf("%s:%d: %s", file, i+1, displayLine))
+				if len(results) >= maxResults {
+					break
+				}
+			}
+		}
+		if len(results) >= maxResults {
+			break
+		}
+	}
+
+	if len(results) == 0 {
+		return "No matches found.", nil
+	}
+
+	if len(results) >= maxResults {
+		results = append(results, "... (results truncated)")
+	}
+
+	return strings.Join(results, "\n"), nil
 }
 
 type ListDirTool struct {
@@ -203,7 +325,7 @@ type MakePatchArgs struct {
 func (t *MakePatchTool) Definition() ToolDefinition {
 	return ToolDefinition{
 		Name:        "make_patch",
-		Description: "Creates a unified diff patch between original and modified content. Returns a standard unified diff format.",
+		Description: "Creates a patch between original and modified content. Returns an INTERNAL OPAQUE STRING. You MUST pass this string EXACTLY as-is to apply_patch. DO NOT try to read, parse, or validate the patch content yourself.",
 		Parameters: json.RawMessage(`{
             "type": "object",
             "properties": {
@@ -222,7 +344,13 @@ func (t *MakePatchTool) Execute(args string) (string, error) {
 	}
 
 	dmp := diffmatchpatch.New()
-	diffs := dmp.DiffMain(a.Original, a.Modified, false)
+
+	// Use Line-Mode diffing for safer config patching
+	// This prevents mid-line edits and ensures whole lines are added/removed/kept
+	text1, text2, linearray := dmp.DiffLinesToChars(a.Original, a.Modified)
+	diffs := dmp.DiffMain(text1, text2, false)
+	diffs = dmp.DiffCharsToLines(diffs, linearray)
+
 	patches := dmp.PatchMake(a.Original, diffs)
 	patchText := dmp.PatchToText(patches)
 
@@ -249,7 +377,7 @@ type ApplyPatchArgs struct {
 func (t *ApplyPatchTool) Definition() ToolDefinition {
 	return ToolDefinition{
 		Name:        "apply_patch",
-		Description: "Applies a patch to the configuration. REQUIRES user confirmation.",
+		Description: "Applies a patch generated by make_patch. The 'patch' argument MUST be the exact raw output string from a previous make_patch call. REQUIRES user confirmation.",
 		Parameters: json.RawMessage(`{
             "type": "object",
             "properties": {
@@ -421,4 +549,148 @@ func (t *RollbackTool) Execute(args string) (string, error) {
 	// But we don't know them here without asking backend or storing manifest.
 	// TODO: Implement robust rollback with manifest storage in SnapshotService
 	return "Rollback not fully implemented. Please manually restore from ~/.local/share/hyprAgent/backups/", nil
+}
+
+// --- Network Tools ---
+
+type FetchURLTool struct{}
+
+type FetchURLArgs struct {
+	URL string `json:"url"`
+}
+
+func (t *FetchURLTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        "fetch_url",
+		Description: "Fetches text content from a URL (HTTP/HTTPS only). Use this to check documentation or wikis. Truncates large responses.",
+		Parameters: json.RawMessage(`{
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to fetch"}
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }`),
+	}
+}
+
+func (t *FetchURLTool) Execute(args string) (string, error) {
+	var a FetchURLArgs
+	if err := ParseArgs(args, &a); err != nil {
+		return "", err
+	}
+
+	if !strings.HasPrefix(a.URL, "http://") && !strings.HasPrefix(a.URL, "https://") {
+		return "", fmt.Errorf("only http and https URLs are allowed")
+	}
+
+	// WHITELIST CHECK
+	// Allow only:
+	// 1. wiki.hypr.land (Official Wiki)
+	// 2. wiki.hyprland.org (Official Wiki Alias)
+	// 3. github.com (Source Code)
+	// 4. raw.githubusercontent.com (Raw File Access)
+	// 5. api.github.com (GitHub API for tree views)
+	allowedDomains := []string{
+		"wiki.hypr.land",
+		"wiki.hyprland.org",
+		"github.com",
+		"raw.githubusercontent.com",
+		"api.github.com",
+	}
+
+	allowed := false
+	for _, domain := range allowedDomains {
+		if strings.Contains(a.URL, "://"+domain) || strings.Contains(a.URL, "://www."+domain) {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		return "", fmt.Errorf("access denied: URL %s is not in the allowed whitelist (wiki.hypr.land, github.com)", a.URL)
+	}
+
+	targetURL := a.URL
+
+	// --- GitHub Smart Handling ---
+	// Handle github.com/.../blob/... -> raw.githubusercontent.com
+	// Handle github.com/.../tree/... -> api.github.com/repos/.../contents
+	// Regex for GitHub URL: github.com/Owner/Repo/(tree|blob)/Ref(/Path)?
+	// Or simple root: github.com/Owner/Repo
+	// We want to capture components.
+
+	// 1. Blob (File) -> Raw
+	blobRegex := regexp.MustCompile(`https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)`)
+	if matches := blobRegex.FindStringSubmatch(targetURL); len(matches) == 5 {
+		owner, repo, ref, path := matches[1], matches[2], matches[3], matches[4]
+		targetURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo, ref, path)
+	}
+
+	// 2. Tree (Directory) or Root -> GitHub API Contents
+	// Case A: explicit tree: github.com/owner/repo/tree/ref/path
+	treeRegex := regexp.MustCompile(`https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)(/(.*))?`)
+	if matches := treeRegex.FindStringSubmatch(targetURL); len(matches) >= 4 {
+		owner, repo, ref := matches[1], matches[2], matches[3]
+		path := ""
+		if len(matches) >= 6 {
+			path = matches[5]
+		}
+		// Ensure trailing slash removed from path if any
+		path = strings.TrimPrefix(path, "/")
+
+		// Construct API URL
+		// https://api.github.com/repos/OWNER/REPO/contents/PATH?ref=REF
+		targetURL = fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repo, path, ref)
+	}
+
+	// Case B: Root of repo (implicit tree main/master)
+	// github.com/owner/repo or github.com/owner/repo/
+	// We can't guess default branch easily without API, but we can try contents/
+	rootRegex := regexp.MustCompile(`https?://github\.com/([^/]+)/([^/]+)/?$`)
+	// Ensure we don't match if it's already processed or is a blob/tree URL not caught above
+	if rootRegex.MatchString(targetURL) && !strings.Contains(targetURL, "/blob/") && !strings.Contains(targetURL, "/tree/") && !strings.Contains(targetURL, "api.github.com") {
+		matches := rootRegex.FindStringSubmatch(targetURL)
+		owner, repo := matches[1], matches[2]
+		targetURL = fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/", owner, repo)
+	}
+
+	// Perform Request
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// If using GitHub API, we need User-Agent (GitHub requires it)
+	if strings.Contains(targetURL, "api.github.com") {
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		req.Header.Set("User-Agent", "HyprAgent/1.0") // GitHub API requires User-Agent
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for Rate Limit
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		if strings.Contains(targetURL, "api.github.com") {
+			return "", fmt.Errorf("GitHub API rate limit exceeded. Please try again later or use a specific raw file URL")
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch URL %s, status code: %d", targetURL, resp.StatusCode)
+	}
+
+	// Limit size to avoid blowing up memory/context (50KB)
+	const maxBytes = 50 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return string(body), nil
 }

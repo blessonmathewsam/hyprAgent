@@ -1,6 +1,6 @@
 # Binaries
-hyprAgent
-hypragent
+/hyprAgent
+/hypragent
 
 # Go build artifacts
 *.exe

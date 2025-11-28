@@ -1,0 +1,31 @@
+# Binaries
+hyprAgent
+hypragent
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+debug.log
+*.log
+
+# Local config (don't commit user configs)
+config.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
